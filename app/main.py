@@ -62,7 +62,7 @@ def create_app(
     )
 
     async def _lease_reaper() -> None:
-        """Release leases whose max duration elapsed, then re-dispatch."""
+        """Reclaim timed-out reservations, expire leases, re-dispatch."""
         while True:
             await asyncio.sleep(max(resolved_tick, 0.01))
             try:
@@ -87,11 +87,13 @@ def create_app(
 
     app = FastAPI(
         title="Render Farm Slot Scheduler",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Backfills idle CPU slots for queued render jobs while preserving "
-            "queue order. Every job leases all of its slots on one node; "
-            "leases are returned explicitly or expire automatically."
+            "queue order. Every job leases all of its slots on one node. "
+            "Jobs with a preparation window reserve their slots as 'pending' "
+            "until the node confirms the start; leases are returned "
+            "explicitly or expire automatically."
         ),
         lifespan=lifespan,
     )
@@ -161,6 +163,7 @@ def create_app(
             job_id=payload.job_id,
             required_slots=payload.required_slots,
             max_duration_seconds=payload.max_duration_seconds,
+            prep_timeout_seconds=payload.prep_timeout_seconds,
         )
         return JobView(**job)
 
@@ -171,7 +174,7 @@ def create_app(
         summary="List jobs in submission order",
     )
     def list_jobs(
-        status_filter: Literal["queued", "running", "completed", "expired"]
+        status_filter: Literal["queued", "pending", "running", "completed", "expired"]
         | None = Query(default=None, alias="status"),
         limit: int = Query(default=200, ge=1, le=1000),
     ) -> list[JobView]:
@@ -191,10 +194,31 @@ def create_app(
         return JobView(**scheduler.get_job(job_id))
 
     @app.post(
+        "/jobs/{job_id}/confirm",
+        response_model=JobView,
+        tags=["jobs"],
+        summary="Confirm a pending job has loaded its assets and starts now",
+        description=(
+            "Moves a `pending` job to `running` and starts its maximum lease "
+            "duration. Repeated confirmation of an already running job "
+            "returns the original lease expiry. Confirmation is rejected for "
+            "jobs whose preparation deadline passed or whose reservation was "
+            "released."
+        ),
+        responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    def confirm_job(job_id: str) -> JobView:
+        return JobView(**scheduler.confirm_job(job_id))
+
+    @app.post(
         "/jobs/{job_id}/release",
         response_model=JobView,
         tags=["jobs"],
         summary="Return a running lease early and re-dispatch",
+        description=(
+            "Only a running lease can be returned. Pending reservations are "
+            "reclaimed automatically when their preparation deadline passes."
+        ),
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
     def release_job(job_id: str) -> JobView:
@@ -224,7 +248,7 @@ def create_app(
         "/admin/tick",
         response_model=TickResponse,
         tags=["system"],
-        summary="Expire due leases and re-dispatch now",
+        summary="Reclaim timed-out reservations, expire leases, re-dispatch now",
     )
     def tick() -> TickResponse:
         events = scheduler.tick()

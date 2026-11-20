@@ -2,7 +2,9 @@
 
 The database is intentionally small: one row per node and one row per job.
 A job owns its whole lease (all slots on one node), so allocations do not
-need a separate table.  Only jobs in the ``running`` state consume capacity.
+need a separate table.  Both ``pending`` (slots reserved, waiting for the
+node to confirm that rendering started) and ``running`` jobs consume
+capacity.
 """
 
 from __future__ import annotations
@@ -18,7 +20,11 @@ from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
-SCHEMA = """
+# Statuses that physically hold slots on a node.
+HELD_STATUSES = ("pending", "running")
+HELD_STATUS_SQL = "('pending', 'running')"
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS nodes (
     node_id       TEXT PRIMARY KEY,
     capacity      INTEGER NOT NULL CHECK (capacity > 0),
@@ -27,20 +33,26 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
-    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id           TEXT NOT NULL UNIQUE,
-    required_slots   INTEGER NOT NULL CHECK (required_slots > 0),
-    max_duration_us  INTEGER NOT NULL CHECK (max_duration_us > 0),
-    status           TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'expired')),
-    submitted_at_us  INTEGER NOT NULL,
-    assigned_node    TEXT REFERENCES nodes(node_id),
-    started_at_us    INTEGER,
-    expires_at_us    INTEGER,
-    ended_at_us      INTEGER,
+    seq                INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id             TEXT NOT NULL UNIQUE,
+    required_slots     INTEGER NOT NULL CHECK (required_slots > 0),
+    max_duration_us    INTEGER NOT NULL CHECK (max_duration_us > 0),
+    prep_timeout_us    INTEGER NOT NULL DEFAULT 0 CHECK (prep_timeout_us >= 0),
+    status             TEXT NOT NULL CHECK (status IN ('queued', 'pending', 'running', 'completed', 'expired')),
+    submitted_at_us    INTEGER NOT NULL,
+    assigned_node      TEXT REFERENCES nodes(node_id),
+    started_at_us      INTEGER,
+    prep_deadline_us   INTEGER,
+    expires_at_us      INTEGER,
+    confirmed_at_us    INTEGER,
+    ended_at_us        INTEGER,
     CHECK (
         status IN ('queued', 'completed', 'expired')
-        OR (assigned_node IS NOT NULL AND started_at_us IS NOT NULL AND expires_at_us IS NOT NULL)
-    )
+        OR (assigned_node IS NOT NULL
+            AND started_at_us IS NOT NULL
+            AND expires_at_us IS NOT NULL)
+    ),
+    CHECK (status <> 'pending' OR prep_deadline_us IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_seq
@@ -51,18 +63,20 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status_expiry
     ON jobs (status, expires_at_us);
 
 -- Defence in depth: even if a future code path (or a manual statement)
--- tries to overbook a node, SQLite rejects it.  The scheduler's in-memory
--- accounting is still the source of allocation decisions; these triggers
--- only enforce the invariant at commit time.
+-- tries to overbook a node, SQLite rejects it.  Pending reservations hold
+-- slots just like running leases, so both count against capacity.  The
+-- scheduler's in-memory accounting is still the source of allocation
+-- decisions; these triggers only enforce the invariant at commit time.
 CREATE TRIGGER IF NOT EXISTS jobs_no_oversubscribe_insert
 BEFORE INSERT ON jobs
-WHEN NEW.status = 'running' AND NEW.assigned_node IS NOT NULL
+WHEN NEW.status IN {HELD_STATUS_SQL} AND NEW.assigned_node IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'node capacity exceeded')
     WHERE (
         SELECT COALESCE(SUM(required_slots), 0)
         FROM jobs
-        WHERE status = 'running' AND assigned_node = NEW.assigned_node
+        WHERE status IN {HELD_STATUS_SQL}
+          AND assigned_node = NEW.assigned_node
     ) + NEW.required_slots > (
         SELECT capacity FROM nodes WHERE node_id = NEW.assigned_node
     );
@@ -70,13 +84,13 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS jobs_no_oversubscribe_update
 BEFORE UPDATE OF status, required_slots, assigned_node ON jobs
-WHEN NEW.status = 'running' AND NEW.assigned_node IS NOT NULL
+WHEN NEW.status IN {HELD_STATUS_SQL} AND NEW.assigned_node IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'node capacity exceeded')
     WHERE (
         SELECT COALESCE(SUM(required_slots), 0)
         FROM jobs
-        WHERE status = 'running'
+        WHERE status IN {HELD_STATUS_SQL}
           AND assigned_node = NEW.assigned_node
           AND seq <> NEW.seq
     ) + NEW.required_slots > (
@@ -89,12 +103,23 @@ BEFORE UPDATE OF capacity ON nodes
 WHEN NEW.capacity < (
     SELECT COALESCE(SUM(required_slots), 0)
     FROM jobs
-    WHERE status = 'running' AND assigned_node = NEW.node_id
+    WHERE status IN {HELD_STATUS_SQL} AND assigned_node = NEW.node_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'node capacity below current usage');
 END;
 """
+
+# Column list of a database created by the pre-preparation-window schema.
+_LEGACY_COLUMNS = (
+    "seq, job_id, required_slots, max_duration_us, status, submitted_at_us, "
+    "assigned_node, started_at_us, expires_at_us, ended_at_us"
+)
+_NEW_COLUMNS = (
+    "seq, job_id, required_slots, max_duration_us, prep_timeout_us, status, "
+    "submitted_at_us, assigned_node, started_at_us, prep_deadline_us, "
+    "expires_at_us, confirmed_at_us, ended_at_us"
+)
 
 
 class Store:
@@ -133,6 +158,7 @@ class Store:
                         # failed switch here is harmless as long as the schema
                         # is applied.
                         logger.warning("could not set WAL mode: %s", exc)
+                    self._migrate_legacy_schema(conn)
                     conn.executescript(SCHEMA)
                     return
                 except sqlite3.OperationalError as exc:  # pragma: no cover
@@ -145,6 +171,29 @@ class Store:
             raise RuntimeError(
                 f"could not initialise database {self.path!r}"
             ) from last_error
+
+    @staticmethod
+    def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+        """Rebuild jobs tables created before preparation windows existed."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+        if not columns or "prep_deadline_us" in columns:
+            return
+        logger.info("migrating legacy jobs table to preparation-window schema")
+        # Renaming moves the legacy indexes/triggers with the table; the new
+        # schema is then applied on top and the rows copied across.
+        conn.execute("ALTER TABLE jobs RENAME TO jobs_legacy")
+        conn.executescript(SCHEMA)
+        conn.execute(
+            f"""
+            INSERT INTO jobs ({_NEW_COLUMNS})
+            SELECT seq, job_id, required_slots, max_duration_us,
+                   0 AS prep_timeout_us, status, submitted_at_us,
+                   assigned_node, started_at_us, NULL AS prep_deadline_us,
+                   expires_at_us, NULL AS confirmed_at_us, ended_at_us
+            FROM jobs_legacy
+            """
+        )
+        conn.execute("DROP TABLE jobs_legacy")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
